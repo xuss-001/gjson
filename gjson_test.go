@@ -2554,3 +2554,70 @@ func TestIndexAtSymbol(t *testing.T) {
 	}`
 	assert(t, Get(json, "@context.@vocab").Index == 85)
 }
+
+func TestChainedModifiersWithArgs(t *testing.T) {
+	json := `{"name":{"first":"Tom","last":"Anderson"},"age":37,` +
+		`"children":["Sara","Alex","Jack"],` +
+		`"first.name":"escaped","first.name2":{"a":1},` +
+		`"deep":{"nested":[1,[2],[3,4]]},` +
+		`"friends":[{"first":"James","last":"Murphy"},` +
+		`{"first":"Roger","last":"Craig"}]}`
+	joined := `{"first":"James","last":"Murphy","first":"Roger","last":"Craig"}`
+
+	// shallow structured-arg chains, pipe and dot-pipe forms
+	assert(t, Get(json, `friends|@join:{"preserve":true}`).Raw == joined)
+	assert(t, Get(json, `friends.@join:{"preserve":true}`).Raw == joined)
+	assert(t, Get(json, `friends|@join:{"preserve":true}|@reverse`).Raw ==
+		`{"last":"Craig","first":"Roger","last":"Murphy","first":"James"}`)
+	assert(t, Get(json, `friends.@join:{"preserve":true}.first`).String() == "James")
+
+	// structured args containing path punctuation must not break parsing
+	assert(t, Get(json, `friends.@join:{"x":"a|b.c"}.first`).String() == "Roger")
+	assert(t, Get(json, `friends|@join:{"x":"a|b"}|@reverse`).Raw ==
+		`{"last":"Craig","first":"Roger"}`)
+	assert(t, Get(json, `name|@pretty:{"indent":".."}|@ugly`).Raw ==
+		`{"first":"Tom","last":"Anderson"}`)
+
+	// nested array/object selectors followed by modifiers with args
+	assert(t, Get(json, `deep.nested|@flatten:{"deep":true}|@reverse|0`).Int() == 4)
+	assert(t, Get(json, `deep.nested.@flatten:{"deep":true}.0`).Int() == 1)
+	assert(t, Get(json, `{"c":children|@reverse}.c.0`).String() == "Jack")
+	assert(t, Get(json, `deep.@values.0.@flatten:{"deep":true}.3`).Int() == 4)
+
+	// multipath selectors containing modifiers with args
+	assert(t, Get(json, `[friends|@join:{"preserve":true},age]`).Raw ==
+		`[`+joined+`,37]`)
+	assert(t, Get(json, `{"a":friends|@join:{"preserve":true}}.a.last`).String() ==
+		"Murphy")
+
+	// plain text args
+	assert(t, Get(json, `children|@valid:children|@reverse|0`).String() == "Jack")
+	assert(t, Get(json, `children.@valid:children|@reverse.0`).String() == "Jack")
+
+	// escaped field names continuing into modifiers
+	assert(t, Get(json, `first\.name|@valid`).String() == "escaped")
+	assert(t, Get(json, `first\.name.@valid`).String() == "escaped")
+	assert(t, Get(json, `first\.name2.@this.a`).Int() == 1)
+	assert(t, Get(json, `first\.name2.@keys.0`).String() == "a")
+
+	// repeated modifier chains
+	assert(t, Get(json, `children|@reverse|@reverse|@reverse`).Raw ==
+		`["Jack","Alex","Sara"]`)
+	assert(t, Get(json, `friends|@join:{"preserve":true}|@join:{"preserve":true}`).Raw ==
+		joined)
+
+	// mixed structured args, text args, and field lookups
+	assert(t, Get(json,
+		`friends|@join:{"preserve":true}|@valid:friends|@keys|0`).String() == "first")
+	assert(t, Get(json, `friends.@join:{"preserve":true}|@reverse.last`).String() ==
+		"Craig")
+
+	// unknown modifiers and invalid args keep existing behavior
+	assert(t, !Get(json, `friends|@unknown:{"a":1}|age`).Exists())
+	assert(t, Get(json, `friends|@join:notjson|@reverse`).Raw ==
+		`{"last":"Craig","first":"Roger"}`)
+
+	// GetMany entry point
+	res := GetMany(json, `friends.@join:{"preserve":true}.last`, `children|@reverse|0`)
+	assert(t, res[0].String() == "Murphy" && res[1].String() == "Jack")
+}
