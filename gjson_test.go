@@ -2554,3 +2554,108 @@ func TestIndexAtSymbol(t *testing.T) {
 	}`
 	assert(t, Get(json, "@context.@vocab").Index == 85)
 }
+
+// TestModifierWithArgsChaining covers modifiers that take structured JSON
+// arguments or plain-text arguments when they appear in the middle of a path,
+// followed by more modifiers or field lookups.
+func TestModifierWithArgsChaining(t *testing.T) {
+	const json = `{
+		"name": {"first": "Janet", "last": "Prichard"},
+		"age": 47,
+		"friends": [
+			{"first": "Dale", "last": "Murphy"},
+			{"first": "Jane", "last": "Murphy"},
+			{"first": "Joe", "last": "Uncool"}
+		]
+	}`
+
+	// shallow structured-argument modifier chain, including a field lookup
+	// that follows the piped modifiers.
+	assert(t, Get(json, `@pretty:{"width":20}|@ugly.age`).Raw == `47`)
+	assert(t, Get(json, `name.@pretty:{"width":20}|@ugly`).Raw ==
+		`{"first":"Janet","last":"Prichard"}`)
+	assert(t, Get(json, `name.@pretty:{"width":20}|@ugly.first`).Raw ==
+		`"Janet"`)
+
+	// nested array and object selectors after an argument-bearing modifier.
+	assert(t, Get(json, `friends.@reverse.0.first`).Raw == `"Joe"`)
+	assert(t, Get(json, `friends.@reverse|0.first`).Raw == `"Joe"`)
+	assert(t, Get(json, `friends.@reverse.[0,2].0.first`).Raw == `"Joe"`)
+	assert(t, Get(json, `friends.@reverse.{f:0.first,l:0.last}.f`).Raw ==
+		`"Joe"`)
+
+	// multipath selectors combined with modifiers.
+	assert(t, Get(json, `[name.first,name.last]|@reverse`).Raw ==
+		`["Prichard","Janet"]`)
+	assert(t, Get(json, `name.{f:first,l:last}|@pretty|@ugly.f`).Raw ==
+		`"Janet"`)
+	assert(t, Get(json, `{f:friends.1.first,a:age}|@ugly.f`).Raw ==
+		`"Jane"`)
+	assert(t, Get(json,
+		`friends.#.{age,first}|@reverse.0.first`).Raw == `"Joe"`)
+
+	// plain-text modifier arguments, both pipe and dot joined.
+	AddModifier("regcase", func(json, arg string) string {
+		switch arg {
+		case "upper":
+			return strings.ToUpper(json)
+		case "lower":
+			return strings.ToLower(json)
+		}
+		return json
+	})
+	assert(t, Get(json, `name.first|@regcase:upper`).Raw == `"JANET"`)
+	assert(t, Get(json, `name.first.@regcase:upper`).Raw == `"JANET"`)
+
+	// dots that are part of the text argument must not be treated as path
+	// separators, and pipes nested inside brackets or quotes are preserved.
+	AddModifier("regecho", func(json, arg string) string {
+		return strconv.Quote(arg)
+	})
+	assert(t, Get(json, `name.first.@regecho:a.b.c`).Raw == `"a.b.c"`)
+	assert(t, Get(json, `@regecho:he(ll|o)`).Raw == `"he(ll|o)"`)
+	assert(t, Get(json, `@regecho:he"ll|o"x`).Raw == `"he\"ll|o\"x"`)
+
+	// escaped field names followed by modifiers and further lookups.
+	assert(t, Get(`{"first.name":{"last":"X"}}`,
+		`first\.name.last`).Raw == `"X"`)
+	assert(t, Get(`{"first.name":{"a|b":"X"}}`,
+		`first\.name.a\|b`).Raw == `"X"`)
+	assert(t, Get(`{"a.b":[3,1,2]}`, `a\.b.@reverse.0`).Raw == `2`)
+	assert(t, Get(`{"a|b":{"x":9}}`, `a\|b.@this.x`).Raw == `9`)
+
+	// repeated modifier chains, both without and with arguments.
+	assert(t, Get(json, `@pretty|@ugly|@pretty|@ugly.age`).Raw == `47`)
+	assert(t, Get(json, `friends|@reverse|@reverse|0.first`).Raw ==
+		`"Dale"`)
+	assert(t, Get(json,
+		`name.@pretty:{"width":20}|@ugly.@pretty:{"width":20}|@ugly.first`,
+	).Raw == `"Janet"`)
+
+	// mixed structured and text arguments with a following field lookup.
+	assert(t, Get(json,
+		`name.@pretty:{"sortKeys":true}|@ugly|@regcase:upper`,
+	).Raw == `{"FIRST":"JANET","LAST":"PRICHARD"}`)
+	assert(t, Get(json,
+		`name.@pretty:{"sortKeys":true}|@ugly.@regcase:upper.first`,
+	).Raw == `{"first":"Janet","last":"Prichard"}`)
+	assert(t, Get(json,
+		`name.first|@regcase:upper|@regcase:lower`).Raw == `"janet"`)
+
+	// array element lookup after a text-argument modifier.
+	assert(t, Get(json, `friends.#.first|@regcase:upper|@reverse|0`).Raw ==
+		`"JOE"`)
+
+	// unknown modifiers and broken paths remain non-existent.
+	assert(t, !Get(json, `name|@nosuchmod|first`).Exists())
+	assert(t, !Get(json, `name.@bogus:whatever.x`).Exists())
+
+	// GetMany shares the same parsing path and must work as well.
+	res := GetMany(json,
+		`name.@pretty:{"width":20}|@ugly.first`,
+		`friends.@reverse.0.first`,
+	)
+	assert(t, len(res) == 2)
+	assert(t, res[0].Raw == `"Janet"`)
+	assert(t, res[1].Raw == `"Joe"`)
+}
