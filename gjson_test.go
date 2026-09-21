@@ -2554,3 +2554,137 @@ func TestIndexAtSymbol(t *testing.T) {
 	}`
 	assert(t, Get(json, "@context.@vocab").Index == 85)
 }
+
+func TestModifierArgsChaining(t *testing.T) {
+	// Regression tests for parameterized modifiers that appear at the
+	// beginning or in the middle of a path. The modifier argument must be
+	// parsed as a single component and the remainder of the path (another
+	// modifier or a field lookup) must continue to evaluate against the
+	// modifier result.
+	AddModifier("echo", func(json, arg string) string {
+		return json
+	})
+	AddModifier("wrap", func(json, arg string) string {
+		return `{"arg":` + squash(arg) + `,"val":` + squash(json) + `}`
+	})
+	AddModifier("pick", func(json, arg string) string {
+		return Get(json, arg).Raw
+	})
+
+	json := `{"name":{"first":"Janet","last":"Prichard"},"age":47,` +
+		`"children":[{"name":"a","age":1},{"name":"b","age":2}],` +
+		`"fav.movie":"Deer Hunter","nums":[10,20,30]}`
+
+	// no-argument modifier chaining keeps working
+	assert(t, Get(json, `@pretty|@ugly`).Raw ==
+		string(pretty.Ugly([]byte(json))))
+
+	// shallow structured JSON argument followed by a modifier and a field
+	r := Get(json, `@echo:{"sortKeys":true}|@ugly.name.first`)
+	assert(t, r.String() == "Janet")
+
+	// structured array argument with nested arrays followed by a field
+	r = Get(json, `@echo:[1,[2,[3]]]|@ugly.name.last`)
+	assert(t, r.String() == "Prichard")
+
+	// plain text argument followed by a field lookup
+	r = Get(json, `@echo:hello|@ugly.name.first`)
+	assert(t, r.String() == "Janet")
+
+	// pipes and dots embedded in structured/quoted args do not split the path
+	r = Get(json, `@echo:{"k":"v|p.x"}|@ugly.age`)
+	assert(t, r.Int() == 47)
+	r = Get(json, `@echo:"with|pipe".age`)
+	assert(t, r.Int() == 47)
+
+	// pipes embedded in parenthesized text args do not split the path
+	r = Get(json, `@echo:a(b|c)|@ugly.age`)
+	assert(t, r.Int() == 47)
+
+	// repeated modifiers with plain and structured args
+	r = Get(json, `@echo:a|@echo:{"b":2}|@echo:c|@ugly.name.first`)
+	assert(t, r.String() == "Janet")
+
+	// mixed structured and text args, then field lookup, from real evaluation
+	r = Get(json, `@echo:{"x":1}|@echo:text|@pretty.name.first`)
+	assert(t, r.String() == "Janet")
+
+	// modifier with options applied mid-path after a nested object/array chain
+	deep := `{"x":[{"y":[{"z":{"b":1,"c":2,"a":3}}]}]}`
+	r = Get(deep, `x.#.y.#.z.@pretty:{"sortKeys":true}`)
+	assert(t, r.Raw == "[[{\n  \"a\": 3,\n  \"b\": 1,\n  \"c\": 2\n}\n]]")
+
+	// nested object selector continues through a parameterized modifier
+	r = Get(json, `name.@echo:{"x":1}|@ugly.first`)
+	assert(t, r.String() == "Janet")
+
+	// nested array element followed by an arg modifier and a field
+	r = Get(json, `children.1.@echo:{"x":1}|@ugly.name`)
+	assert(t, r.String() == "b")
+
+	// array index then parameterized modifier with real evaluation
+	r = Get(json, `nums.1|@echo:x`)
+	assert(t, r.Int() == 20)
+
+	// multipath (object) selector then a parameterized modifier
+	r = Get(json, `{fn:name.first,ln:name.last}|@ugly`)
+	assert(t, r.Raw == `{"fn":"Janet","ln":"Prichard"}`)
+
+	// multipath (array) selector then a parameterized modifier
+	r = Get(json, `[name.first,name.last]|@ugly`)
+	assert(t, r.Raw == `["Janet","Prichard"]`)
+
+	// multipath selector with a parameterized modifier inside
+	r = Get(json, `{f:name.first|@echo:up}|@ugly`)
+	assert(t, r.Raw == `{"f":"Janet"}`)
+
+	// nested array query continuation through an argument modifier
+	r = Get(json, `children.#(age>1).@echo:q|@ugly.name`)
+	assert(t, r.String() == "b")
+	r = Get(json, `children.#.name|@ugly`)
+	assert(t, r.Raw == `["a","b"]`)
+
+	// escaped field name followed by a parameterized modifier (dot and pipe
+	// escaping must not break modifier recognition)
+	r = Get(json, `fav\.movie|@ugly`)
+	assert(t, r.String() == "Deer Hunter")
+	r = Get(json, `fav\.movie.@echo:z`)
+	assert(t, r.String() == "Deer Hunter")
+	r = Get(json, `fav\.movie.@echo:z|@ugly`)
+	assert(t, r.String() == "Deer Hunter")
+	r = Get(json, `{m:fav\.movie}|@ugly`)
+	assert(t, r.Raw == `{"m":"Deer Hunter"}`)
+
+	// modifier whose plain text argument is itself a path: evaluated for real
+	r = Get(json, `@pick:name.first`)
+	assert(t, r.String() == "Janet")
+	r = Get(json, `@pick:children.1.name|@ugly`)
+	assert(t, r.String() == "b")
+
+	// structured argument is delivered verbatim to the modifier and the
+	// following field lookup operates on the modifier result
+	r = Get(json, `@wrap:{"opt":true}.val.name.first`)
+	assert(t, r.String() == "Janet")
+	assert(t, Get(json, `@wrap:{"opt":true}.arg.opt`).Bool())
+
+	// GetMany / GetManyBytes exercise the shared path parsing too
+	mr := GetMany(json, `name.@echo:x`, `fav\.movie.@echo:z`,
+		`@echo:{"a":1}|@ugly.age`)
+	assert(t, len(mr) == 3)
+	assert(t, mr[0].Raw ==
+		string(pretty.Ugly([]byte(Get(json, "name").Raw))))
+	assert(t, mr[1].String() == "Deer Hunter")
+	assert(t, mr[2].Int() == 47)
+	mb := GetManyBytes([]byte(deep), `x.#.y.#.z.@pretty:{"sortKeys":true}`)
+	assert(t, len(mb) == 1 && mb[0].Raw ==
+		"[[{\n  \"a\": 3,\n  \"b\": 1,\n  \"c\": 2\n}\n]]")
+
+	// bytes-based public entry shares the same behavior
+	assert(t, string(GetBytes([]byte(json),
+		`@echo:{"k":1}|@ugly.name.first`).Raw) == `"Janet"`)
+
+	// unknown modifiers and invalid paths stay non-existent / compatible
+	assert(t, !Get(json, `@unknown:x.name`).Exists())
+	assert(t, !Get(json, `name.missing.@echo:x.deep`).Exists())
+	assert(t, Get(json, `@echo:`).Raw == Get(json, `@echo`).Raw)
+}
